@@ -1,0 +1,7 @@
+yfinance
+numpy
+pandas
+scikit-learn
+tensorflow
+gspread
+google-auth
