@@ -1,103 +1,87 @@
 import yfinance as yf
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from textblob import TextBlob
+import feedparser
 import gspread
 from google.oauth2.service_account import Credentials
 import os
 import json
+from datetime import datetime
+import urllib.parse
+import time
 
-# --- GİZLİ KİMLİK DOĞRULAMASI (GITHUB SECRETS'TEN ÇEKİLİR) ---
+# --- 1. GİZLİ KİMLİK DOĞRULAMASI (GITHUB SECRETS) ---
+# GitHub Ayarlarındaki GCP_CREDENTIALS kısmını kullanır
 scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 gcp_json_str = os.environ.get('GCP_CREDENTIALS')
 creds_dict = json.loads(gcp_json_str)
 creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
 gc = gspread.authorize(creds)
 
-# --- AYARLAR ---
-hisseler = ['THYAO.IS', 'ASELS.IS', 'KCHOL.IS', 'BIMAS.IS', 'TUPRS.IS']
-tahminler = {}
-tablo_adi = "Borsa_Tahminleri_ESP32"
-
-def terbiye_edilmis_model(hisse_adi):
-    print(f"\n⚙️ {hisse_adi} için Filtreli Model eğitiliyor...")
-    df = yf.download(hisse_adi, period='3y', interval='1d', progress=False)
-    
-    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
-    delta = df['Close'].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-    
-    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp1 - exp2
-    df.dropna(inplace=True)
-    
-    features = df[['Open', 'High', 'Low', 'Close', 'Volume', 'EMA_20', 'RSI', 'MACD']].values
-    target = df[['Close']].values
-    
-    scaler_x = MinMaxScaler(feature_range=(0, 1))
-    scaler_y = MinMaxScaler(feature_range=(0, 1))
-    
-    scaled_features = scaler_x.fit_transform(features)
-    scaled_target = scaler_y.fit_transform(target)
-    
-    prediction_days = 60
-    x_train, y_train = [], []
-    for x in range(prediction_days, len(scaled_features)):
-        x_train.append(scaled_features[x-prediction_days:x])
-        y_train.append(scaled_target[x, 0])
+# --- 2. DUYGU ANALİZİ (FINANSAL SÖZLÜK DESTEKLİ) ---
+def get_detailed_sentiment(hisse_adi):
+    try:
+        query = urllib.parse.quote(f"{hisse_adi} hisse haberleri")
+        url = f"https://news.google.com/rss/search?q={query}&hl=tr&gl=TR&ceid=TR:tr"
+        feed = feedparser.parse(url)
         
-    x_train, y_train = np.array(x_train), np.array(y_train)
-    
-    model = Sequential([
-        LSTM(units=64, return_sequences=True, input_shape=(x_train.shape[1], x_train.shape[2])),
-        Dropout(0.2),
-        LSTM(units=64, return_sequences=False),
-        Dropout(0.2),
-        Dense(units=32, activation='relu'),
-        Dense(units=1)
-    ])
-    
-    model.compile(optimizer='adam', loss='mean_squared_error')
-    model.fit(x_train, y_train, epochs=20, batch_size=32, verbose=0)
-    
-    last_60_days = scaled_features[-prediction_days:]
-    last_60_days = np.expand_dims(last_60_days, axis=0)
-    
-    prediction_scaled = model.predict(last_60_days, verbose=0)
-    raw_prediction = float(scaler_y.inverse_transform(prediction_scaled)[0][0])
-    
-    current_price = df['Close'].iloc[-1]
-    fark = raw_prediction - current_price
-    smoothed_prediction = current_price + (fark * 0.70) 
-    
-    return float(smoothed_prediction)
+        pozitif = ["temettü", "rekor", "yükseliş", "alım", "pozitif", "kar", "artış", "anlaşma"]
+        negatif = ["düşüş", "zarar", "negatif", "satış", "kriz", "düşük", "kayıp", "gerileme"]
 
-print("--- OTONOM YAPAY ZEKA EĞİTİMİ BAŞLIYOR ---")
+        if not feed.entries: return 0.0, "Notr"
+        puan = 0
+        limit = min(len(feed.entries), 3)
+        for entry in feed.entries[:limit]:
+            baslik = entry.title.lower()
+            for k in pozitif:
+                if k in baslik: puan += 0.30
+            for k in negatif:
+                if k in baslik: puan -= 0.30
+            puan += TextBlob(entry.title).sentiment.polarity
+        
+        avg = puan / limit
+        durum = "Pozitif" if avg > 0.02 else ("Negatif" if avg < -0.02 else "Notr")
+        return avg, durum
+    except: return 0.0, "Hata"
+
+# --- 3. ANA İŞLEM VE SENKRONİZASYON ---
+hisseler = ['THYAO.IS', 'ASELS.IS', 'KCHOL.IS', 'BIMAS.IS', 'EREGL.IS']
+sh = gc.open("Borsa_Tahminleri_ESP32")
+worksheet = sh.get_worksheet(0)
+
+print("--- AKILLI BORSA TERMİNALİ GÜNCELLEMESİ BAŞLIYOR ---")
+yeni_satirlar = []
+
 for h in hisseler:
     try:
-        sonuc = terbiye_edilmis_model(h)
-        tahminler[h] = sonuc
-        print(f"✅ {h}: {sonuc:.2f} TL")
+        # Fiyat Verisi (En güncel)
+        df = yf.download(h, period='2d', interval='1m', progress=False)
+        son_fiyat = float(df['Close'].iloc[-1].item())
+        
+        # Duygu Analizi
+        h_sade = h.replace('.IS', '')
+        duygu_skoru, duygu_metni = get_detailed_sentiment(h_sade)
+        
+        # Hibrit Tahmin: Teknik fiyat + Haber etkisi (%5 duyarlılık)
+        # Haber pozitifse fiyatı yukarı, negatifse aşağı esnetir
+        tahmin_fiyat = son_fiyat * (1 + (duygu_skoru * 0.05) + 0.002)
+        
+        yeni_satirlar.append([
+            h_sade, 
+            round(son_fiyat, 2), 
+            round(tahmin_fiyat, 2), 
+            duygu_metni, 
+            datetime.now().strftime("%H:%M:%S")
+        ])
+        print(f"✅ {h_sade}: Analiz Tamamlandı ({duygu_metni})")
+        time.sleep(1) # Yahoo engelini önlemek için
     except Exception as e:
         print(f"❌ {h} hatası: {e}")
 
-sh = gc.open(tablo_adi)
-sheet = sh.sheet1
-sheet.clear()
-sheet.update_acell('A1', 'Hisse')
-sheet.update_acell('B1', 'Tahmin')
+# --- 4. VERİLERİ SİLMEDEN GÜNCELLEME (KRİTİK!) ---
+# sheet.clear() KULLANMIYORUZ. Sadece A-E (Hisse-Saat) arasını güncelliyoruz.
+# Böylece F ve G sütunundaki Adet ve Maliyet verilerin korunur.
+worksheet.update('A2:E6', yeni_satirlar)
 
-satir = 2
-for hisse, tahmin in tahminler.items():
-    hisse_kisa = hisse.replace('.IS', '') 
-    sheet.update_cell(satir, 1, hisse_kisa)
-    sheet.update_cell(satir, 2, str(round(tahmin, 2)))
-    satir += 1
-
-print("\n🚀 Otonom sistem başarıyla verileri E-Tablo'ya yazdı!")
+print("\n🚀 Tüm sistemler (Sheets, Power BI, ESP32) başarıyla senkronize edildi!")
