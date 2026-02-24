@@ -5,3 +5,10 @@ scikit-learn
 tensorflow
 gspread
 google-auth
+yfinance
+pandas
+numpy
+textblob
+feedparser
+gspread
+google-auth
